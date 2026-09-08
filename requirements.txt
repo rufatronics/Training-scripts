@@ -1,0 +1,6 @@
+datasets
+datasketch
+tree-sitter>=0.22.0
+tree-sitter-language-pack
+huggingface_hub
+pyarrow
