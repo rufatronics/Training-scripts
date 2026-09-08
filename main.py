@@ -207,6 +207,7 @@ def get_minhash(code: str) -> MinHash:
     m = MinHash(num_perm=128)
     for i in range(len(tokens) - 4):
         ngram = " ".join(tokens[i : i + 5])
+        m.update(ngram.encode("utf-8"))
     return m
 
 
@@ -220,7 +221,7 @@ def is_unique(code: str, doc_id: str) -> bool:
 
 
 # ==========================================
-# 5. STREAMING EXECUTION PIPELINE
+# 5. STREAMING VIA DIRECT FILE MANIFEST
 # ==========================================
 TARGET_LANGUAGES = {
     "python",
@@ -233,10 +234,30 @@ TARGET_LANGUAGES = {
     "typescript",
 }
 
-print("Loading dataset stream from codeparrot/github-code-clean...")
-dataset_stream = load_dataset(
-    "codeparrot/github-code-clean", streaming=True, split="train"
+print("Scanning source repository file manifest...")
+all_repo_files = api.list_repo_files(
+    repo_id="codeparrot/github-code-clean", repo_type="dataset"
 )
+
+parquet_files = [
+    f"hf://datasets/codeparrot/github-code-clean/{f}"
+    for f in all_repo_files
+    if f.endswith(".parquet")
+]
+json_files = [
+    f"hf://datasets/codeparrot/github-code-clean/{f}"
+    for f in all_repo_files
+    if f.endswith((".json", ".json.gz", ".jsonl", ".jsonl.gz"))
+]
+
+if parquet_files:
+    print(f"Found {len(parquet_files)} Parquet file(s). Streaming via parquet builder...")
+    dataset_stream = load_dataset("parquet", data_files=parquet_files, streaming=True, split="train")
+elif json_files:
+    print(f"Found {len(json_files)} JSON file(s). Streaming via json builder...")
+    dataset_stream = load_dataset("json", data_files=json_files, streaming=True, split="train")
+else:
+    raise RuntimeError("No supported parquet or json data files found in source repository.")
 
 BATCH_SIZE = 10000
 cleaned_buffer = []
@@ -259,12 +280,9 @@ for item in dataset_stream:
     if raw_lang not in TARGET_LANGUAGES:
         continue
 
-    if raw_lang in state.get("completed_languages", []):
-        continue
-
     now = time.time()
     if (now - START_TIME) > MAX_RUNTIME_SECONDS:
-        print("\nApproaching time limit! Staging buffer and committing state...")
+        print("\nApproaching GitHub Actions time limit! Staging buffer and committing state...")
         if cleaned_buffer:
             shard_counter += 1
             shard = Dataset.from_list(cleaned_buffer)
@@ -308,4 +326,4 @@ sync_staging_to_hf(
 )
 print(
     f"\nExecution complete! Gold Dataset live at: https://huggingface.co/datasets/{REPO_ID}"
-    )
+        )
