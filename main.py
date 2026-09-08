@@ -32,7 +32,6 @@ api.create_repo(
 )
 print(f"Target repository active: https://huggingface.co/datasets/{REPO_ID}")
 
-# GitHub Actions hard limit safety (5.25 hours) and sync interval (45 min)
 MAX_RUNTIME_SECONDS = 5.25 * 3600
 SYNC_INTERVAL_SECONDS = 45 * 60
 START_TIME = time.time()
@@ -54,7 +53,7 @@ def load_remote_state():
             return json.load(f)
     except Exception:
         print("No existing state found on Hub. Initializing fresh pipeline state.")
-        return {"completed_languages": [], "current_language": None, "last_index": 0}
+        return {"completed_languages": [], "last_index": 0}
 
 
 def sync_staging_to_hf(state, commit_msg="Batch update shards and pipeline state"):
@@ -195,7 +194,7 @@ def passes_ruthless_scrubbing(example: dict) -> bool:
 
 
 # ==========================================
-# 4. MINHASH DEDUPLICATION Engine
+# 4. MINHASH DEDUPLICATION ENGINE
 # ==========================================
 lsh = MinHashLSH(threshold=0.70, num_perm=128)
 
@@ -208,7 +207,6 @@ def get_minhash(code: str) -> MinHash:
     m = MinHash(num_perm=128)
     for i in range(len(tokens) - 4):
         ngram = " ".join(tokens[i : i + 5])
-        m.update(ngram.encode("utf-8"))
     return m
 
 
@@ -222,134 +220,88 @@ def is_unique(code: str, doc_id: str) -> bool:
 
 
 # ==========================================
-# 5. DYNAMIC PARQUET FILE DISCOVERY
+# 5. STREAMING EXECUTION PIPELINE
 # ==========================================
-print("Fetching dataset manifest from Hugging Face Hub...")
-all_repo_files = api.list_repo_files(
-    repo_id="codeparrot/github-code-clean", repo_type="dataset"
+TARGET_LANGUAGES = {
+    "python",
+    "c",
+    "cpp",
+    "javascript",
+    "go",
+    "rust",
+    "java",
+    "typescript",
+}
+
+print("Loading dataset stream from codeparrot/github-code-clean...")
+dataset_stream = load_dataset(
+    "codeparrot/github-code-clean", streaming=True, split="train"
 )
-
-TARGET_LANGUAGES = [
-    "Python",
-    "C",
-    "CPP",
-    "JavaScript",
-    "Go",
-    "Rust",
-    "Java",
-    "TypeScript",
-]
-
-
-def get_parquet_urls_for_lang(lang_name: str) -> list[str]:
-    urls = []
-    target_lower = lang_name.lower()
-
-    for file_path in all_repo_files:
-        if not file_path.endswith(".parquet"):
-            continue
-
-        parts = [p.lower() for p in file_path.split("/")]
-        if target_lower in parts:
-            urls.append(f"hf://datasets/codeparrot/github-code-clean/{file_path}")
-
-    return sorted(urls)
-
 
 BATCH_SIZE = 10000
 cleaned_buffer = []
 shard_counter = 0
+current_idx = 0
+resume_from = state.get("last_index", 0)
 
-for lang in TARGET_LANGUAGES:
-    if lang in state.get("completed_languages", []):
-        print(f"Skipping already completed language: {lang}")
+print(f"Resuming from dataset row index: {resume_from}")
+
+for item in dataset_stream:
+    current_idx += 1
+
+    if current_idx <= resume_from:
         continue
 
-    file_urls = get_parquet_urls_for_lang(lang)
-    if not file_urls:
-        print(f"Warning: No parquet files found for language target: {lang}")
+    raw_lang = (item.get("language") or "").lower().strip()
+    if raw_lang == "c++":
+        raw_lang = "cpp"
+
+    if raw_lang not in TARGET_LANGUAGES:
         continue
 
-    print(
-        f"\n--- Processing Target Language: {lang} ({len(file_urls)} parquet source files) ---"
-    )
+    if raw_lang in state.get("completed_languages", []):
+        continue
 
-    dataset_stream = load_dataset(
-        "parquet", data_files=file_urls, streaming=True, split="train"
-    )
-
-    current_idx = 0
-    resume_from = (
-        state["last_index"] if state.get("current_language") == lang else 0
-    )
-
-    for item in dataset_stream:
-        current_idx += 1
-
-        if current_idx <= resume_from:
-            continue
-
-        now = time.time()
-        # Timeout handling
-        if (now - START_TIME) > MAX_RUNTIME_SECONDS:
-            print(
-                "\nApproaching GitHub Actions execution timeout! Staging buffer and committing state..."
-            )
-            if cleaned_buffer:
-                shard_counter += 1
-                shard = Dataset.from_list(cleaned_buffer)
-                shard.to_parquet(
-                    f"{STAGING_DIR}/shard_{int(now)}_{shard_counter}.parquet"
-                )
-
-            state["current_language"] = lang
-            state["last_index"] = current_idx
-            sync_staging_to_hf(
-                state, commit_msg="Automated run timeout checkpoint"
-            )
-            print("Pipeline state safely synced to Hub. Exiting clean.")
-            exit(0)
-
-        # Periodic commit interval check
-        if (now - LAST_SYNC_TIME) > SYNC_INTERVAL_SECONDS:
-            state["current_language"] = lang
-            state["last_index"] = current_idx
-            sync_staging_to_hf(state, commit_msg="Periodic 45m checkpoint sync")
-
-        if not passes_ruthless_scrubbing(item):
-            continue
-
-        doc_id = f"doc_{current_idx}"
-        if not is_unique(item["code"], doc_id):
-            continue
-
-        cleaned_buffer.append(item)
-
-        # Stage batch locally without hitting API rate limits
-        if len(cleaned_buffer) >= BATCH_SIZE:
+    now = time.time()
+    if (now - START_TIME) > MAX_RUNTIME_SECONDS:
+        print("\nApproaching time limit! Staging buffer and committing state...")
+        if cleaned_buffer:
             shard_counter += 1
-            shard_path = (
-                f"{STAGING_DIR}/shard_{int(now)}_{shard_counter}.parquet"
-            )
             shard = Dataset.from_list(cleaned_buffer)
-            shard.to_parquet(shard_path)
-            print(f"Staged local shard: {shard_path} | Total Scanned: {current_idx}")
+            shard.to_parquet(f"{STAGING_DIR}/shard_{int(now)}_{shard_counter}.parquet")
 
-            cleaned_buffer = []
-            state["current_language"] = lang
-            state["last_index"] = current_idx
+        state["last_index"] = current_idx
+        sync_staging_to_hf(state, commit_msg="Automated run timeout checkpoint")
+        print("Pipeline state safely synced to Hub. Exiting clean.")
+        exit(0)
 
-    state.setdefault("completed_languages", []).append(lang)
-    state["current_language"] = None
-    state["last_index"] = 0
+    if (now - LAST_SYNC_TIME) > SYNC_INTERVAL_SECONDS:
+        state["last_index"] = current_idx
+        sync_staging_to_hf(state, commit_msg="Periodic 45m checkpoint sync")
 
-# Final flush after all languages complete
+    if not passes_ruthless_scrubbing(item):
+        continue
+
+    doc_id = f"doc_{current_idx}"
+    if not is_unique(item["code"], doc_id):
+        continue
+
+    cleaned_buffer.append(item)
+
+    if len(cleaned_buffer) >= BATCH_SIZE:
+        shard_counter += 1
+        shard_path = f"{STAGING_DIR}/shard_{int(now)}_{shard_counter}.parquet"
+        shard = Dataset.from_list(cleaned_buffer)
+        shard.to_parquet(shard_path)
+        print(f"Staged local shard: {shard_path} | Total Scanned: {current_idx}")
+
+        cleaned_buffer = []
+        state["last_index"] = current_idx
+
 if cleaned_buffer:
     shard_counter += 1
     shard = Dataset.from_list(cleaned_buffer)
-    shard.to_parquet(
-        f"{STAGING_DIR}/shard_{int(time.time())}_{shard_counter}.parquet"
-    )
+    shard.to_parquet(f"{STAGING_DIR}/shard_{int(time.time())}_{shard_counter}.parquet")
 
 sync_staging_to_hf(
     state, commit_msg="Pipeline complete: All dataset shards uploaded"
