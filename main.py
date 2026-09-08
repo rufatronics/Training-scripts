@@ -6,7 +6,7 @@ import shutil
 import time
 from datasets import Dataset, load_dataset
 from datasketch import MinHash, MinHashLSH
-from huggingface_hub import HfApi, hf_hub_download, login
+from huggingface_hub import HfApi, HfFileSystem, hf_hub_download, login
 from tree_sitter_language_pack import get_parser
 
 # ==========================================
@@ -32,7 +32,6 @@ api.create_repo(
 )
 print(f"Target repository active: https://huggingface.co/datasets/{REPO_ID}")
 
-# Safety limits: 5.25 hrs run max; flush commit every 45 mins (2700s)
 MAX_RUNTIME_SECONDS = 5.25 * 3600
 SYNC_INTERVAL_SECONDS = 45 * 60
 START_TIME = time.time()
@@ -54,13 +53,12 @@ def load_remote_state():
             return json.load(f)
     except Exception:
         print("No existing state found on Hub. Starting clean pipeline.")
-        return {"completed_urls": [], "current_url": None, "last_index": 0}
+        return {"completed_languages": [], "current_language": None, "last_index": 0}
 
 
 def sync_staging_to_hf(state, commit_msg="Batch update shards and pipeline state"):
     global LAST_SYNC_TIME
     
-    # Write current state directly inside staging directory to bundle in 1 commit
     state_file_path = os.path.join(STAGING_DIR, STATE_FILENAME)
     with open(state_file_path, "w") as f:
         json.dump(state, f, indent=2)
@@ -79,7 +77,6 @@ def sync_staging_to_hf(state, commit_msg="Batch update shards and pipeline state
     )
     print("Sync successful!")
 
-    # Clear uploaded shards locally while keeping workspace clean
     shutil.rmtree(STAGING_DIR)
     os.makedirs(STAGING_DIR, exist_ok=True)
     LAST_SYNC_TIME = time.time()
@@ -197,7 +194,7 @@ def passes_ruthless_scrubbing(example: dict) -> bool:
 
 
 # ==========================================
-# 4. MINHASH DEDUPLICATION & BATCH ENGINE
+# 4. MINHASH DEDUPLICATION
 # ==========================================
 lsh = MinHashLSH(threshold=0.70, num_perm=128)
 
@@ -223,35 +220,48 @@ def is_unique(code: str, doc_id: str) -> bool:
     return True
 
 
-TARGET_PATHS = [
-    "hf://datasets/codeparrot/github-code-clean/data/Python/*.parquet",
-    "hf://datasets/codeparrot/github-code-clean/data/C/*.parquet",
-    "hf://datasets/codeparrot/github-code-clean/data/CPP/*.parquet",
-    "hf://datasets/codeparrot/github-code-clean/data/JavaScript/*.parquet",
-    "hf://datasets/codeparrot/github-code-clean/data/Go/*.parquet",
-    "hf://datasets/codeparrot/github-code-clean/data/Rust/*.parquet",
-    "hf://datasets/codeparrot/github-code-clean/data/Java/*.parquet",
-    "hf://datasets/codeparrot/github-code-clean/data/TypeScript/*.parquet",
-]
+# ==========================================
+# 5. DYNAMIC PARQUET FILE MANIFEST DISCOVERY
+# ==========================================
+fs = HfFileSystem()
+print("Scanning source repository file tree...")
+all_source_files = fs.glob("datasets/codeparrot/github-code-clean/**/*.parquet")
 
-BATCH_SIZE = 10000  # Larger local shard size
+TARGET_LANGUAGES = ["Python", "C", "CPP", "JavaScript", "Go", "Rust", "Java", "TypeScript"]
+
+def get_parquet_urls_for_lang(lang_name):
+    urls = []
+    target_str = lang_name.lower()
+    for filepath in all_source_files:
+        path_lower = filepath.lower()
+        if f"/{target_str}/" in path_lower or f"-{target_str}-" in path_lower or f"/{target_str}_" in path_lower:
+            urls.append(f"hf://{filepath}")
+    return sorted(urls)
+
+
+BATCH_SIZE = 10000
 cleaned_buffer = []
 shard_counter = 0
 
-for target_url in TARGET_PATHS:
-    if target_url in state["completed_urls"]:
-        print(f"Skipping completed URL pattern: {target_url}")
+for lang in TARGET_LANGUAGES:
+    if lang in state.get("completed_languages", []):
+        print(f"Skipping completed language: {lang}")
         continue
 
-    print(f"\n--- Processing Target Pattern: {target_url} ---")
+    file_urls = get_parquet_urls_for_lang(lang)
+    if not file_urls:
+        print(f"Warning: No parquet files matched for language target: {lang}")
+        continue
+
+    print(f"\n--- Processing Language Target: {lang} ({len(file_urls)} parquet files) ---")
 
     dataset_stream = load_dataset(
-        "parquet", data_files=target_url, streaming=True, split="train"
+        "parquet", data_files=file_urls, streaming=True, split="train"
     )
 
     current_idx = 0
     resume_from = (
-        state["last_index"] if state["current_url"] == target_url else 0
+        state["last_index"] if state.get("current_language") == lang else 0
     )
 
     for item in dataset_stream:
@@ -261,7 +271,6 @@ for target_url in TARGET_PATHS:
             continue
 
         now = time.time()
-        # 1. Graceful Shutdown Check (Approaching GH Actions 6h limit)
         if (now - START_TIME) > MAX_RUNTIME_SECONDS:
             print("\nReaching GH Actions time limit! Staging remaining buffer and syncing...")
             if cleaned_buffer:
@@ -269,17 +278,16 @@ for target_url in TARGET_PATHS:
                 shard = Dataset.from_list(cleaned_buffer)
                 shard.to_parquet(f"{STAGING_DIR}/shard_{int(now)}_{shard_counter}.parquet")
 
-            state["current_url"] = target_url
+            state["current_language"] = lang
             state["last_index"] = current_idx
             sync_staging_to_hf(state, commit_msg="Automated timeout checkpoint")
             print("Job state synchronized safely. Exiting cleanly.")
             exit(0)
 
-        # 2. Periodic HF Sync Check (Every 45 minutes)
         if (now - LAST_SYNC_TIME) > SYNC_INTERVAL_SECONDS:
-            state["current_url"] = target_url
+            state["current_language"] = lang
             state["last_index"] = current_idx
-            sync_staging_to_hf(state, commit_msg="Periodic 45m checkpoint")
+            sync_staging_to_hf(state, commit_msg="Periodic checkpoint sync")
 
         if not passes_ruthless_scrubbing(item):
             continue
@@ -290,7 +298,6 @@ for target_url in TARGET_PATHS:
 
         cleaned_buffer.append(item)
 
-        # Stage batch locally as a Parquet file without committing to HF immediately
         if len(cleaned_buffer) >= BATCH_SIZE:
             shard_counter += 1
             shard_path = f"{STAGING_DIR}/shard_{int(now)}_{shard_counter}.parquet"
@@ -299,14 +306,13 @@ for target_url in TARGET_PATHS:
             print(f"Staged local shard: {shard_path} | Scanned: {current_idx}")
 
             cleaned_buffer = []
-            state["current_url"] = target_url
+            state["current_language"] = lang
             state["last_index"] = current_idx
 
-    state["completed_urls"].append(target_url)
-    state["current_url"] = None
+    state.setdefault("completed_languages", []).append(lang)
+    state["current_language"] = None
     state["last_index"] = 0
 
-# Final flush upon script completion
 if cleaned_buffer:
     shard_counter += 1
     shard = Dataset.from_list(cleaned_buffer)
